@@ -125,6 +125,13 @@ func formatMB(_ mb: Double) -> String {
     mb >= 1024 ? String(format: "%.1f GB", mb / 1024) : String(format: "%.0f MB", mb)
 }
 
+func diskFreeGB() -> Double {
+    let keys: Set<URLResourceKey> = [.volumeAvailableCapacityForImportantUsageKey]
+    guard let values = try? URL(fileURLWithPath: "/").resourceValues(forKeys: keys),
+          let bytes = values.volumeAvailableCapacityForImportantUsage else { return 0 }
+    return Double(bytes) / 1_073_741_824
+}
+
 // MARK: - Health model
 
 final class HealthMonitor: ObservableObject {
@@ -137,11 +144,15 @@ final class HealthMonitor: ObservableObject {
     @Published var jamfCPU: Double = 0
     @Published var idleShells: [ProcRecord] = []
     @Published var staleAgents: [ProcRecord] = []
+    @Published var topProcessName: String = "-"
+    @Published var topProcessCPU: Double = 0
+    @Published var diskFreeGBValue: Double = 0
     @Published var lastChecked: Date = Date()
     @Published var shellsKilledThisSession = 0
     @Published var agentsKilledThisSession = 0
 
     private var timer: Timer?
+    private var currentInterval: TimeInterval = 0
     private let defaults = UserDefaults.standard
     private let selfPid = getpid()
 
@@ -151,47 +162,77 @@ final class HealthMonitor: ObservableObject {
     var memBad: Bool { availableMemPercent < 15 }
     var shellsBad: Bool { idleShells.count > 20 }
     var jamfBad: Bool { jamfCPU >= 20 }
-    var anyBad: Bool { uptimeBad || swapBad || memBad || shellsBad || jamfBad }
+    var diskBad: Bool { diskFreeGBValue < 10 }
+    var anyBad: Bool { uptimeBad || swapBad || memBad || shellsBad || jamfBad || diskBad }
+
+    /// Short glanceable tag for the menu-bar icon when something needs attention.
+    var badgeText: String? {
+        if uptimeBad { return "\(Int(uptimeDaysValue))d" }
+        if swapBad { return "SWAP" }
+        if memBad { return "MEM" }
+        if diskBad { return "DISK" }
+        if jamfBad { return "JAMF" }
+        if shellsBad { return "SHELLS" }
+        return nil
+    }
 
     func start() {
         refresh()
-        // Native syscalls only — this timer costs microseconds per tick, safe at 5 min.
-        timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
-            self?.refresh()
-        }
+        scheduleTimer(interval: 600)
     }
 
-    func refresh() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            let days = uptimeDays()
-            let load = loadAvgString()
-            let swap = swapInfo()
-            let memPct = availableMemoryPercent()
-            let procs = listProcs()
-            let ancestors = ancestorPids(of: self.selfPid, procs: procs)
-
-            let jamf = procs.first { $0.comm == "JamfDaemon" }?.cpuPercent ?? 0
-            let shells = procs
-                .filter { ($0.comm == "zsh" || $0.comm == "bash") && $0.ageHours >= 6 && !ancestors.contains($0.pid) }
-                .sorted { $0.ageHours > $1.ageHours }
-            let agents = procs
-                .filter { $0.comm.lowercased().contains("claude") && $0.ageHours >= 24 && !ancestors.contains($0.pid) }
-                .sorted { $0.ageHours > $1.ageHours }
-
-            DispatchQueue.main.async {
-                self.uptimeDaysValue = days
-                self.loadAvg = load
-                self.swapUsedMB = swap.usedMB
-                self.swapTotalMB = swap.totalMB
-                self.availableMemPercent = memPct
-                self.jamfCPU = jamf
-                self.idleShells = shells
-                self.staleAgents = agents
-                self.lastChecked = Date()
-                self.maybeNotify()
-            }
+    /// Checks less often while healthy, more often while something's flagged —
+    /// same near-zero cost per check either way, just tuned to how urgent it is.
+    private func scheduleTimer(interval: TimeInterval) {
+        guard interval != currentInterval else { return }
+        currentInterval = interval
+        timer?.invalidate()
+        let t = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            self?.refresh()
         }
+        t.tolerance = interval * 0.1 // let the OS coalesce this wake with others
+        timer = t
+    }
+
+    /// Runs synchronously on the calling thread (Timer fires on the main run loop).
+    /// These are all direct syscalls now — a full pass over ~1000 processes takes low
+    /// single-digit milliseconds, so there's nothing here worth a background queue hop.
+    /// (A background `.utility` queue was tried and dropped: on an `LSUIElement`
+    /// menu-bar-only app with no visible window, App Nap throttled that queue hard
+    /// enough that refresh() never ran at all.)
+    func refresh() {
+        let days = uptimeDays()
+        let load = loadAvgString()
+        let swap = swapInfo()
+        let memPct = availableMemoryPercent()
+        let procs = listProcs()
+        let ancestors = ancestorPids(of: selfPid, procs: procs)
+
+        let jamf = procs.first { $0.comm == "JamfDaemon" }?.cpuPercent ?? 0
+        let shells = procs
+            .filter { ($0.comm == "zsh" || $0.comm == "bash") && $0.ageHours >= 6 && !ancestors.contains($0.pid) }
+            .sorted { $0.ageHours > $1.ageHours }
+        let agents = procs
+            .filter { $0.comm.lowercased().contains("claude") && $0.ageHours >= 24 && !ancestors.contains($0.pid) }
+            .sorted { $0.ageHours > $1.ageHours }
+        let top = procs
+            .filter { $0.pid != selfPid && $0.comm != "kernel_task" }
+            .max { $0.cpuPercent < $1.cpuPercent }
+
+        uptimeDaysValue = days
+        loadAvg = load
+        swapUsedMB = swap.usedMB
+        swapTotalMB = swap.totalMB
+        availableMemPercent = memPct
+        jamfCPU = jamf
+        idleShells = shells
+        staleAgents = agents
+        topProcessName = top?.comm ?? "-"
+        topProcessCPU = top?.cpuPercent ?? 0
+        diskFreeGBValue = diskFreeGB()
+        lastChecked = Date()
+        maybeNotify()
+        scheduleTimer(interval: anyBad ? 60 : 600)
     }
 
     private func maybeNotify() {
@@ -200,6 +241,7 @@ final class HealthMonitor: ObservableObject {
         checkRule("mem", memBad, "Memory pressure high", "Only \(availableMemPercent)% available — things may slow down or get killed.")
         checkRule("shells", shellsBad, "Idle shells piling up", "\(idleShells.count) idle shell processes — clean up in Mac Health.")
         checkRule("jamf", jamfBad, "Jamf using high CPU", "JamfDaemon at \(Int(jamfCPU))% — may need a reboot.")
+        checkRule("disk", diskBad, "Disk space low", "Only \(String(format: "%.1f", diskFreeGBValue))GB free on the boot volume.")
         weeklyDigest()
     }
 
@@ -290,7 +332,11 @@ struct MenuContent: View {
             StatRow(label: "Load avg", value: monitor.loadAvg, bad: false)
             StatRow(label: "Swap", value: "\(formatMB(monitor.swapUsedMB)) / \(formatMB(monitor.swapTotalMB))", bad: monitor.swapBad)
             StatRow(label: "Available memory", value: "\(monitor.availableMemPercent)% of \(String(format: "%.0f", monitor.totalRAMGB))GB", bad: monitor.memBad)
-            StatRow(label: "Jamf CPU", value: "\(Int(monitor.jamfCPU))%", bad: monitor.jamfBad)
+            StatRow(label: "Disk free", value: "\(String(format: "%.0f", monitor.diskFreeGBValue))GB", bad: monitor.diskBad)
+            StatRow(label: "Top process", value: "\(monitor.topProcessName) (\(Int(monitor.topProcessCPU))%)", bad: false)
+            if monitor.jamfCPU > 0 || monitor.jamfBad {
+                StatRow(label: "Jamf (MDM) CPU", value: "\(Int(monitor.jamfCPU))%", bad: monitor.jamfBad)
+            }
             StatRow(label: "Idle shells", value: "\(monitor.idleShells.count)", bad: monitor.shellsBad)
             StatRow(label: "Stale agent sessions", value: "\(monitor.staleAgents.count)", bad: !monitor.staleAgents.isEmpty)
 
@@ -341,7 +387,12 @@ struct MacHealthApp: App {
         MenuBarExtra {
             MenuContent(monitor: monitor)
         } label: {
-            Image(systemName: monitor.anyBad ? "exclamationmark.triangle.fill" : "heart.fill")
+            HStack(spacing: 3) {
+                Image(systemName: monitor.anyBad ? "exclamationmark.triangle.fill" : "heart.fill")
+                if let badge = monitor.badgeText {
+                    Text(badge)
+                }
+            }
         }
         .menuBarExtraStyle(.window)
     }
