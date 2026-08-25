@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Darwin
 
 // MARK: - Shell helper (only used for rare, user-triggered actions)
@@ -73,10 +74,133 @@ struct ProcRecord: Identifiable {
     let ppid: Int32
     let comm: String
     let ageHours: Double
-    let cpuPercent: Double
+    let cpuNanos: UInt64
+    let rssBytes: UInt64
+    let path: String
+    /// Filled in by HealthMonitor from the delta against the previous sample —
+    /// the kernel's own `p_pctcpu` is hardwired to 0 on modern macOS.
+    var cpuPercent: Double = 0
+    /// Working directory and owning app, resolved only for the cleanup lists —
+    /// path resolution is the priciest lookup here, so it isn't done for all ~800 procs.
+    var cwd: String = ""
+    var owner: String = ""
+
+    /// "claude · my-worktree" — what the shell is actually sitting in, so a row is
+    /// identifiable without going hunting for the PID.
+    var contextLabel: String {
+        let folder = (cwd as NSString).lastPathComponent
+        let place = (cwd.isEmpty || cwd == "/") ? nil : folder
+        switch (owner.isEmpty ? nil : owner, place) {
+        case let (owner?, place?): return "\(owner) · \(place)"
+        case let (owner?, nil): return owner
+        case let (nil, place?): return place
+        default: return comm
+        }
+    }
+
+    /// Outermost `.app` bundle in the executable path, so the 20 renderer helpers
+    /// under Brave Browser.app all roll up to one entry instead of 20.
+    var bundlePath: String? {
+        guard let r = path.range(of: ".app/") else { return path.hasSuffix(".app") ? path : nil }
+        return path[path.startIndex..<r.lowerBound] + ".app"
+    }
+
+    /// What a human calls it: the app bundle name, else the first meaningful path
+    /// component. `.../claude/versions/2.1.241` reads as "claude", not "2.1.241" —
+    /// the kernel's `p_comm` is just the (often versioned) executable filename.
+    var appName: String {
+        if let b = bundlePath {
+            return (b as NSString).lastPathComponent.replacingOccurrences(of: ".app", with: "")
+        }
+        let generic: Set<String> = ["bin", "sbin", "libexec", "versions", "installation", "MacOS", "Contents"]
+        let named = comm.rangeOfCharacter(from: .letters) != nil && !generic.contains(comm)
+        if named || path.isEmpty { return comm }
+        for part in path.split(separator: "/").reversed() {
+            let name = String(part)
+            if name.rangeOfCharacter(from: .letters) != nil && !generic.contains(name) { return name }
+        }
+        return comm
+    }
 }
 
-private let FSCALE = 2048.0 // from <sys/param.h>, stable BSD constant
+/// Memory usage rolled up per app (all helper processes summed).
+struct AppMemory: Identifiable {
+    var id: String { name }
+    let name: String
+    let bundlePath: String?
+    let bytes: UInt64
+    let procCount: Int
+}
+
+/// App icons never change while we're running; fetching one hits the disk, so keep them.
+private var iconCache: [String: NSImage] = [:]
+
+func appIcon(for bundlePath: String?) -> NSImage? {
+    guard let bundlePath else { return nil }
+    if let cached = iconCache[bundlePath] { return cached }
+    let icon = NSWorkspace.shared.icon(forFile: bundlePath)
+    iconCache[bundlePath] = icon
+    return icon
+}
+
+/// Physical footprint of a process — the same figure Activity Monitor's "Memory"
+/// column shows. Resident size was tried first and rejected: it counts shared
+/// library pages once per process, which inflated a 62-helper browser to 9 GB.
+///
+/// Only readable for processes we own; root-owned system daemons return 0 without
+/// elevated privileges and are left out of the rollup rather than reported as free.
+///
+/// `proc_pid_rusage` takes the address of the struct itself, cast to `rusage_info_t *`
+/// — passing a pointer to a pointer variable makes the kernel write the whole struct
+/// over that 8-byte variable and smash the stack.
+func footprintBytes(_ pid: Int32) -> UInt64 {
+    var ru = rusage_info_v0()
+    let rc = withUnsafeMutablePointer(to: &ru) { p -> Int32 in
+        p.withMemoryRebound(to: rusage_info_t?.self,
+                            capacity: MemoryLayout<rusage_info_v0>.size / MemoryLayout<rusage_info_t?>.size) {
+            proc_pid_rusage(pid, RUSAGE_INFO_V0, $0)
+        }
+    }
+    return rc == 0 ? ru.ri_phys_footprint : 0
+}
+
+/// Total CPU time a process has burned since it started, in nanoseconds.
+/// Two samples of this are what produce a real CPU percentage.
+func cpuNanos(_ pid: Int32) -> UInt64 {
+    var info = proc_taskinfo()
+    let rc = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &info, Int32(MemoryLayout<proc_taskinfo>.size))
+    return rc > 0 ? info.pti_total_user + info.pti_total_system : 0
+}
+
+/// Working directory of a process. Readable for processes we own.
+func processCwd(_ pid: Int32) -> String {
+    var info = proc_vnodepathinfo()
+    let rc = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, Int32(MemoryLayout<proc_vnodepathinfo>.size))
+    guard rc > 0 else { return "" }
+    return withUnsafeBytes(of: &info.pvi_cdir.vip_path) {
+        String(cString: $0.baseAddress!.assumingMemoryBound(to: CChar.self))
+    }
+}
+
+func executablePath(_ pid: Int32) -> String {
+    var buf = [CChar](repeating: 0, count: 4096)
+    let len = proc_pidpath(pid, &buf, UInt32(buf.count))
+    return len > 0 ? String(cString: buf) : ""
+}
+
+func topMemoryApps(_ procs: [ProcRecord], limit: Int = 5) -> [AppMemory] {
+    var totals: [String: (bytes: UInt64, count: Int, bundle: String?)] = [:]
+    for p in procs where p.rssBytes > 0 {
+        let key = p.appName
+        let prev = totals[key] ?? (0, 0, p.bundlePath)
+        totals[key] = (prev.bytes + p.rssBytes, prev.count + 1, prev.bundle ?? p.bundlePath)
+    }
+    return totals
+        .map { AppMemory(name: $0.key, bundlePath: $0.value.bundle, bytes: $0.value.bytes, procCount: $0.value.count) }
+        .sorted { $0.bytes > $1.bytes }
+        .prefix(limit)
+        .map { $0 }
+}
 
 func listProcs() -> [ProcRecord] {
     var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0]
@@ -102,9 +226,11 @@ func listProcs() -> [ProcRecord] {
         let start = kp.kp_proc.p_un.__p_starttime
         let startEpoch = Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
         let ageHours = max(0, (now - startEpoch) / 3600)
-        let cpuPercent = Double(kp.kp_proc.p_pctcpu) / FSCALE * 100
+        let footprint = footprintBytes(pid)
         out.append(ProcRecord(id: pid, pid: pid, ppid: kp.kp_eproc.e_ppid, comm: comm,
-                               ageHours: ageHours, cpuPercent: cpuPercent))
+                               ageHours: ageHours, cpuNanos: cpuNanos(pid),
+                               rssBytes: footprint,
+                               path: footprint > 0 ? executablePath(pid) : ""))
     }
     return out
 }
@@ -119,6 +245,11 @@ func ancestorPids(of pid: Int32, procs: [ProcRecord]) -> Set<Int32> {
         current = parent
     }
     return result
+}
+
+func formatBytes(_ bytes: UInt64) -> String {
+    let gb = Double(bytes) / 1_073_741_824
+    return gb >= 1 ? String(format: "%.1f GB", gb) : String(format: "%.0f MB", Double(bytes) / 1_048_576)
 }
 
 func formatMB(_ mb: Double) -> String {
@@ -146,6 +277,7 @@ final class HealthMonitor: ObservableObject {
     @Published var staleAgents: [ProcRecord] = []
     @Published var topProcessName: String = "-"
     @Published var topProcessCPU: Double = 0
+    @Published var topApps: [AppMemory] = []
     @Published var diskFreeGBValue: Double = 0
     @Published var lastChecked: Date = Date()
     @Published var shellsKilledThisSession = 0
@@ -153,6 +285,8 @@ final class HealthMonitor: ObservableObject {
 
     private var timer: Timer?
     private var currentInterval: TimeInterval = 0
+    private var prevCPUNanos: [Int32: UInt64] = [:]
+    private var prevCPUSample: Date?
     private let defaults = UserDefaults.standard
     private let selfPid = getpid()
 
@@ -205,19 +339,20 @@ final class HealthMonitor: ObservableObject {
         let load = loadAvgString()
         let swap = swapInfo()
         let memPct = availableMemoryPercent()
-        let procs = listProcs()
+        let procs = withCPUPercent(listProcs())
         let ancestors = ancestorPids(of: selfPid, procs: procs)
 
         let jamf = procs.first { $0.comm == "JamfDaemon" }?.cpuPercent ?? 0
-        let shells = procs
+        let shells = describe(procs
             .filter { ($0.comm == "zsh" || $0.comm == "bash") && $0.ageHours >= 6 && !ancestors.contains($0.pid) }
-            .sorted { $0.ageHours > $1.ageHours }
-        let agents = procs
+            .sorted { $0.ageHours > $1.ageHours }, in: procs)
+        let agents = describe(procs
             .filter { $0.comm.lowercased().contains("claude") && $0.ageHours >= 24 && !ancestors.contains($0.pid) }
-            .sorted { $0.ageHours > $1.ageHours }
+            .sorted { $0.ageHours > $1.ageHours }, in: procs)
         let top = procs
             .filter { $0.pid != selfPid && $0.comm != "kernel_task" }
             .max { $0.cpuPercent < $1.cpuPercent }
+        let apps = topMemoryApps(procs)
 
         uptimeDaysValue = days
         loadAvg = load
@@ -227,12 +362,45 @@ final class HealthMonitor: ObservableObject {
         jamfCPU = jamf
         idleShells = shells
         staleAgents = agents
-        topProcessName = top?.comm ?? "-"
+        topProcessName = top?.appName ?? "-"
         topProcessCPU = top?.cpuPercent ?? 0
+        topApps = apps
         diskFreeGBValue = diskFreeGB()
         lastChecked = Date()
         maybeNotify()
         scheduleTimer(interval: anyBad ? 60 : 600)
+    }
+
+    /// Attach the working directory and the owning app to the processes we're about to
+    /// offer to kill. A shell whose parent is launchd has outlived whatever started it.
+    private func describe(_ subset: [ProcRecord], in all: [ProcRecord]) -> [ProcRecord] {
+        let names = Dictionary(all.map { ($0.pid, $0.appName) }, uniquingKeysWith: { a, _ in a })
+        return subset.map { p in
+            var q = p
+            q.cwd = processCwd(p.pid)
+            let parent = names[p.ppid] ?? ""
+            q.owner = (parent == "launchd" || parent.isEmpty) ? "orphan" : parent
+            return q
+        }
+    }
+
+    /// CPU percent = CPU time burned since the last refresh / wall time elapsed.
+    /// Can exceed 100% for a multithreaded process, same as Activity Monitor.
+    /// The first sample after launch has no baseline, so everything reads 0%.
+    private func withCPUPercent(_ procs: [ProcRecord]) -> [ProcRecord] {
+        let now = Date()
+        let elapsed = prevCPUSample.map { now.timeIntervalSince($0) } ?? 0
+        var out = procs
+        if elapsed > 0.5 {
+            let elapsedNanos = elapsed * 1_000_000_000
+            for i in out.indices {
+                guard let prev = prevCPUNanos[out[i].pid], out[i].cpuNanos > prev else { continue }
+                out[i].cpuPercent = Double(out[i].cpuNanos - prev) / elapsedNanos * 100
+            }
+        }
+        prevCPUNanos = Dictionary(procs.map { ($0.pid, $0.cpuNanos) }, uniquingKeysWith: { a, _ in a })
+        prevCPUSample = now
+        return out
     }
 
     private func maybeNotify() {
@@ -286,15 +454,87 @@ final class HealthMonitor: ObservableObject {
 
 // MARK: - UI
 
+private let cardBG = Color.primary.opacity(0.05)
+
+struct Card<Content: View>: View {
+    let title: String
+    let icon: String
+    @ViewBuilder var content: Content
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.caption2)
+                Text(title).font(.caption).fontWeight(.semibold).textCase(.uppercase)
+            }
+            .foregroundColor(.secondary)
+            content
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(cardBG))
+    }
+}
+
 struct StatRow: View {
     let label: String
     let value: String
     let bad: Bool
+    var hint: String? = nil
     var body: some View {
-        HStack {
-            Text(label).foregroundColor(.secondary)
-            Spacer()
-            Text(value).fontWeight(.medium).foregroundColor(bad ? .red : .primary)
+        VStack(alignment: .leading, spacing: 1) {
+            HStack {
+                Text(label).foregroundColor(.secondary)
+                Spacer()
+                Text(value).fontWeight(.medium).monospacedDigit()
+                    .foregroundColor(bad ? .red : .primary)
+            }
+            if let hint {
+                Text(hint).font(.caption2).foregroundColor(.secondary)
+            }
+        }
+        .font(.callout)
+    }
+}
+
+/// Horizontal fill bar — turns a bare percentage into something readable at a glance.
+struct MeterBar: View {
+    let fraction: Double
+    let bad: Bool
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.primary.opacity(0.12))
+                Capsule().fill(bad ? Color.red : Color.accentColor)
+                    .frame(width: max(2, geo.size.width * min(1, max(0, fraction))))
+            }
+        }
+        .frame(height: 5)
+    }
+}
+
+struct AppMemRow: View {
+    let app: AppMemory
+    let maxBytes: UInt64
+    var body: some View {
+        HStack(spacing: 7) {
+            if let icon = appIcon(for: app.bundlePath) {
+                Image(nsImage: icon).resizable().frame(width: 16, height: 16)
+            } else {
+                Image(systemName: "terminal").font(.caption)
+                    .frame(width: 16, height: 16).foregroundColor(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(app.name).lineLimit(1).truncationMode(.middle)
+                    if app.procCount > 1 {
+                        Text("×\(app.procCount)").font(.caption2).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Text(formatBytes(app.bytes)).monospacedDigit().foregroundColor(.secondary)
+                }
+                .font(.callout)
+                MeterBar(fraction: maxBytes > 0 ? Double(app.bytes) / Double(maxBytes) : 0, bad: false)
+            }
         }
     }
 }
@@ -305,13 +545,18 @@ struct ProcListView: View {
     var body: some View {
         if !procs.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.caption).foregroundColor(.secondary)
-                ForEach(procs.prefix(5)) { p in
-                    Text("PID \(p.pid) · \(String(format: "%.1f", p.ageHours))h old")
-                        .font(.caption2).foregroundColor(.secondary)
+                ForEach(procs.prefix(4)) { p in
+                    HStack(spacing: 4) {
+                        Text(p.contextLabel).lineLimit(1).truncationMode(.middle)
+                        Spacer(minLength: 4)
+                        Text("\(String(p.pid)) · \(Int(p.ageHours))h").monospacedDigit()
+                    }
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .help(p.cwd.isEmpty ? p.comm : p.cwd)
                 }
-                if procs.count > 5 {
-                    Text("+ \(procs.count - 5) more").font(.caption2).foregroundColor(.secondary)
+                if procs.count > 4 {
+                    Text("+ \(procs.count - 4) more").font(.caption2).foregroundColor(.secondary)
                 }
             }
         }
@@ -325,57 +570,94 @@ struct MenuContent: View {
     @State private var confirmReboot = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Mac Health").font(.headline)
-
-            StatRow(label: "Uptime", value: "\(Int(monitor.uptimeDaysValue)) days", bad: monitor.uptimeBad)
-            StatRow(label: "Load avg", value: monitor.loadAvg, bad: false)
-            StatRow(label: "Swap", value: "\(formatMB(monitor.swapUsedMB)) / \(formatMB(monitor.swapTotalMB))", bad: monitor.swapBad)
-            StatRow(label: "Available memory", value: "\(monitor.availableMemPercent)% of \(String(format: "%.0f", monitor.totalRAMGB))GB", bad: monitor.memBad)
-            StatRow(label: "Disk free", value: "\(String(format: "%.0f", monitor.diskFreeGBValue))GB", bad: monitor.diskBad)
-            StatRow(label: "Top process", value: "\(monitor.topProcessName) (\(Int(monitor.topProcessCPU))%)", bad: false)
-            if monitor.jamfCPU > 0 || monitor.jamfBad {
-                StatRow(label: "Jamf (MDM) CPU", value: "\(Int(monitor.jamfCPU))%", bad: monitor.jamfBad)
-            }
-            StatRow(label: "Idle shells", value: "\(monitor.idleShells.count)", bad: monitor.shellsBad)
-            StatRow(label: "Stale agent sessions", value: "\(monitor.staleAgents.count)", bad: !monitor.staleAgents.isEmpty)
-
-            ProcListView(title: "Idle shells", procs: monitor.idleShells)
-            ProcListView(title: "Stale agents", procs: monitor.staleAgents)
-
-            Divider()
-
-            Button("Clean up idle shells (\(monitor.idleShells.count))") { confirmShells = true }
-                .disabled(monitor.idleShells.isEmpty)
-                .confirmationDialog("Terminate \(monitor.idleShells.count) idle shell processes?", isPresented: $confirmShells) {
-                    Button("Terminate", role: .destructive) { monitor.killIdleShells() }
-                }
-
-            Button("Clean up stale agent sessions (\(monitor.staleAgents.count))") { confirmAgents = true }
-                .disabled(monitor.staleAgents.isEmpty)
-                .confirmationDialog("Terminate \(monitor.staleAgents.count) stale Claude/agent sessions?", isPresented: $confirmAgents) {
-                    Button("Terminate", role: .destructive) { monitor.killStaleAgents() }
-                }
-
-            Button("Reboot now") { confirmReboot = true }
-                .confirmationDialog("Reboot this Mac now?", isPresented: $confirmReboot) {
-                    Button("Reboot", role: .destructive) { monitor.rebootNow() }
-                }
-
-            if monitor.shellsKilledThisSession > 0 || monitor.agentsKilledThisSession > 0 {
-                Text("Cleaned up \(monitor.shellsKilledThisSession) shells, \(monitor.agentsKilledThisSession) agents this session")
-                    .font(.caption2).foregroundColor(.secondary)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Image(systemName: monitor.anyBad ? "exclamationmark.triangle.fill" : "heart.fill")
+                    .foregroundColor(monitor.anyBad ? .orange : .pink)
+                Text("Mac Health").font(.headline)
+                Spacer()
+                Button { monitor.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                    .buttonStyle(.borderless)
+                    .help("Refresh now")
             }
 
-            Divider()
-            Button("Refresh") { monitor.refresh() }
+            Card(title: "System", icon: "cpu") {
+                StatRow(label: "Uptime", value: "\(Int(monitor.uptimeDaysValue)) days", bad: monitor.uptimeBad)
+                StatRow(label: "Load avg", value: monitor.loadAvg, bad: false)
+                StatRow(label: "Disk free", value: "\(String(format: "%.0f", monitor.diskFreeGBValue))GB", bad: monitor.diskBad)
+                if monitor.topProcessCPU >= 1 {
+                    StatRow(label: "Busiest app", value: "\(monitor.topProcessName) \(Int(monitor.topProcessCPU))% CPU", bad: false)
+                }
+                if monitor.jamfCPU > 0 || monitor.jamfBad {
+                    StatRow(label: "Jamf (MDM) CPU", value: "\(Int(monitor.jamfCPU))%", bad: monitor.jamfBad)
+                }
+            }
+
+            Card(title: "Memory", icon: "memorychip") {
+                StatRow(label: "Available",
+                        value: "\(monitor.availableMemPercent)% of \(String(format: "%.0f", monitor.totalRAMGB))GB",
+                        bad: monitor.memBad)
+                MeterBar(fraction: Double(100 - monitor.availableMemPercent) / 100, bad: monitor.memBad)
+                StatRow(label: "Swap",
+                        value: "\(formatMB(monitor.swapUsedMB)) / \(formatMB(monitor.swapTotalMB))",
+                        bad: monitor.swapBad,
+                        hint: monitor.swapUsedPercent >= 50
+                            ? "macOS reuses swap files — only a reboot actually clears this."
+                            : nil)
+                MeterBar(fraction: monitor.swapUsedPercent / 100, bad: monitor.swapBad)
+            }
+
+            if !monitor.topApps.isEmpty {
+                Card(title: "Memory by app", icon: "square.stack.3d.up") {
+                    ForEach(monitor.topApps) { app in
+                        AppMemRow(app: app, maxBytes: monitor.topApps.first?.bytes ?? 0)
+                    }
+                    Text("Memory footprint, helper processes rolled up. Swap is not attributable per app.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+
+            Card(title: "Cleanup", icon: "trash") {
+                StatRow(label: "Idle shells", value: "\(monitor.idleShells.count)", bad: monitor.shellsBad)
+                ProcListView(title: "Idle shells", procs: monitor.idleShells)
+                StatRow(label: "Stale agent sessions", value: "\(monitor.staleAgents.count)", bad: !monitor.staleAgents.isEmpty)
+                ProcListView(title: "Stale agents", procs: monitor.staleAgents)
+
+                HStack {
+                    Button("Kill shells (\(monitor.idleShells.count))") { confirmShells = true }
+                        .disabled(monitor.idleShells.isEmpty)
+                        .confirmationDialog("Terminate \(monitor.idleShells.count) idle shell processes?", isPresented: $confirmShells) {
+                            Button("Terminate", role: .destructive) { monitor.killIdleShells() }
+                        }
+                    Button("Kill agents (\(monitor.staleAgents.count))") { confirmAgents = true }
+                        .disabled(monitor.staleAgents.isEmpty)
+                        .confirmationDialog("Terminate \(monitor.staleAgents.count) stale Claude/agent sessions?", isPresented: $confirmAgents) {
+                            Button("Terminate", role: .destructive) { monitor.killStaleAgents() }
+                        }
+                }
+                .controlSize(.small)
+
+                if monitor.shellsKilledThisSession > 0 || monitor.agentsKilledThisSession > 0 {
+                    Text("Cleaned \(monitor.shellsKilledThisSession) shells, \(monitor.agentsKilledThisSession) agents this session")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+
+            HStack {
+                Button("Reboot now") { confirmReboot = true }
+                    .confirmationDialog("Reboot this Mac now?", isPresented: $confirmReboot) {
+                        Button("Reboot", role: .destructive) { monitor.rebootNow() }
+                    }
+                Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+            }
+            .controlSize(.small)
+
             Text("Checked \(monitor.lastChecked.formatted(date: .omitted, time: .standard))")
-                .font(.caption).foregroundColor(.secondary)
-
-            Button("Quit Mac Health") { NSApplication.shared.terminate(nil) }
+                .font(.caption2).foregroundColor(.secondary)
         }
         .padding(12)
-        .frame(width: 300)
+        .frame(width: 320)
     }
 }
 
