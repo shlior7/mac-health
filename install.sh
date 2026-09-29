@@ -20,8 +20,7 @@ cat > "$AGENT" <<PLIST
     <string>$BUNDLE_ID</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/open</string>
-        <string>$APP</string>
+        <string>$APP/Contents/MacOS/MacHealth</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -32,6 +31,9 @@ PLIST
 launchctl unload "$AGENT" 2>/dev/null || true
 launchctl load "$AGENT"
 
-open "$APP"
+# Launch directly so an unsigned local build does not depend on LaunchServices.
+# If an instance is already running, the launch request may return non-zero;
+# installation itself is still complete in that case.
+"$APP/Contents/MacOS/MacHealth" >/dev/null 2>&1 &
 echo "Installed. Mac Health is running in the menu bar and will start automatically at login."
 echo "Uninstall any time with ./uninstall.sh"
