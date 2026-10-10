@@ -86,7 +86,11 @@ struct ProcRecord: Identifiable {
     var owner: String = ""
     /// Names of direct child processes — a shell with a running child is doing something.
     var children: [String] = []
-    var isActive: Bool { !children.isEmpty || cpuPercent >= 1 }
+    /// CPU burned by direct children — a shell/launcher itself sits at 0% while its children work.
+    var childCPU: Double = 0
+    /// Dead but not yet reaped by its parent: no cwd, no memory, and SIGTERM does nothing.
+    var isZombie = false
+    var isActive: Bool { !isZombie && (!children.isEmpty || cpuPercent + childCPU >= 1) }
 
     /// "claude · my-worktree" — what the shell is actually sitting in, so a row is
     /// identifiable without going hunting for the PID.
@@ -230,10 +234,12 @@ func listProcs() -> [ProcRecord] {
         let startEpoch = Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
         let ageHours = max(0, (now - startEpoch) / 3600)
         let footprint = footprintBytes(pid)
-        out.append(ProcRecord(id: pid, pid: pid, ppid: kp.kp_eproc.e_ppid, comm: comm,
-                               ageHours: ageHours, cpuNanos: cpuNanos(pid),
-                               rssBytes: footprint,
-                               path: footprint > 0 ? executablePath(pid) : ""))
+        var rec = ProcRecord(id: pid, pid: pid, ppid: kp.kp_eproc.e_ppid, comm: comm,
+                             ageHours: ageHours, cpuNanos: cpuNanos(pid),
+                             rssBytes: footprint,
+                             path: footprint > 0 ? executablePath(pid) : "")
+        rec.isZombie = kp.kp_proc.p_stat == Int8(SZOMB)
+        out.append(rec)
     }
     return out
 }
@@ -278,6 +284,7 @@ final class HealthMonitor: ObservableObject {
     @Published var jamfCPU: Double = 0
     @Published var idleShells: [ProcRecord] = []
     @Published var staleAgents: [ProcRecord] = []
+    @Published var zombies: [ProcRecord] = []
     @Published var topProcessName: String = "-"
     @Published var topProcessCPU: Double = 0
     @Published var topApps: [AppMemory] = []
@@ -315,6 +322,8 @@ final class HealthMonitor: ObservableObject {
 
     func start() {
         refresh()
+        // CPU% needs two samples; without this every row reads 0% for the first 10 minutes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.refresh() }
         scheduleTimer(interval: 600)
     }
 
@@ -347,10 +356,12 @@ final class HealthMonitor: ObservableObject {
 
         let jamf = procs.first { $0.comm == "JamfDaemon" }?.cpuPercent ?? 0
         let shells = describe(procs
-            .filter { ($0.comm == "zsh" || $0.comm == "bash") && $0.ageHours >= 6 && !ancestors.contains($0.pid) }
+            .filter { !$0.isZombie && ($0.comm == "zsh" || $0.comm == "bash") && $0.ageHours >= 6 && !ancestors.contains($0.pid) }
             .sorted { $0.ageHours > $1.ageHours }, in: procs)
         let agents = describe(procs
-            .filter { $0.comm.lowercased().contains("claude") && $0.ageHours >= 24 && !ancestors.contains($0.pid) }
+            .filter { !$0.isZombie && $0.comm.lowercased().contains("claude") && $0.ageHours >= 24 && !ancestors.contains($0.pid) }
+            .sorted { $0.ageHours > $1.ageHours }, in: procs)
+        let dead = describe(procs.filter { $0.isZombie && $0.ageHours >= 1 }
             .sorted { $0.ageHours > $1.ageHours }, in: procs)
         let top = procs
             .filter { $0.pid != selfPid && $0.comm != "kernel_task" }
@@ -365,6 +376,7 @@ final class HealthMonitor: ObservableObject {
         jamfCPU = jamf
         idleShells = shells
         staleAgents = agents
+        zombies = dead
         topProcessName = top?.appName ?? "-"
         topProcessCPU = top?.cpuPercent ?? 0
         topApps = apps
@@ -383,6 +395,7 @@ final class HealthMonitor: ObservableObject {
             var q = p
             q.cwd = processCwd(p.pid)
             q.children = (kids[p.pid] ?? []).map(\.appName)
+            q.childCPU = (kids[p.pid] ?? []).reduce(0) { $0 + $1.cpuPercent }
             let parent = names[p.ppid] ?? ""
             q.owner = (parent == "launchd" || parent.isEmpty) ? "orphan" : parent
             return q
@@ -682,7 +695,9 @@ struct SessionsView: View {
                     Spacer(minLength: 8)
                     VStack(alignment: .trailing, spacing: 1) {
                         Text("pid \(String(p.pid)) · \(Int(p.ageHours))h")
-                        Text(String(format: "CPU %.1f%% · ", p.cpuPercent) + formatBytes(p.rssBytes))
+                        Text(String(format: "CPU %.1f%%", p.cpuPercent)
+                             + (p.childCPU > 0 ? String(format: " (+%.1f%% children)", p.childCPU) : "")
+                             + " · " + formatBytes(p.rssBytes))
                     }
                     .font(.caption).monospacedDigit().foregroundColor(.secondary)
                 }
@@ -697,6 +712,23 @@ struct SessionsView: View {
         List {
             section("Idle shells", monitor.idleShells)
             section("Stale agent sessions", monitor.staleAgents)
+            if !monitor.zombies.isEmpty {
+                Section {
+                    ForEach(monitor.zombies) { p in
+                        HStack {
+                            Text("\(p.comm) · pid \(String(p.pid)) · \(Int(p.ageHours))h")
+                            Spacer()
+                            Text("parent: \(p.owner) (pid \(String(p.ppid)))")
+                        }
+                        .font(.caption).foregroundColor(.secondary)
+                    }
+                } header: {
+                    Text("Zombies — \(monitor.zombies.count), already dead").font(.headline)
+                } footer: {
+                    Text("Exited but never reaped by the parent, so no folder or memory is left. Can't be killed; they go away when the parent exits.")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
         }
         .frame(minWidth: 560, minHeight: 420)
         .overlay(alignment: .bottom) {
