@@ -84,6 +84,9 @@ struct ProcRecord: Identifiable {
     /// path resolution is the priciest lookup here, so it isn't done for all ~800 procs.
     var cwd: String = ""
     var owner: String = ""
+    /// Names of direct child processes — a shell with a running child is doing something.
+    var children: [String] = []
+    var isActive: Bool { !children.isEmpty || cpuPercent >= 1 }
 
     /// "claude · my-worktree" — what the shell is actually sitting in, so a row is
     /// identifiable without going hunting for the PID.
@@ -375,9 +378,11 @@ final class HealthMonitor: ObservableObject {
     /// offer to kill. A shell whose parent is launchd has outlived whatever started it.
     private func describe(_ subset: [ProcRecord], in all: [ProcRecord]) -> [ProcRecord] {
         let names = Dictionary(all.map { ($0.pid, $0.appName) }, uniquingKeysWith: { a, _ in a })
+        let kids = Dictionary(grouping: all, by: \.ppid)
         return subset.map { p in
             var q = p
             q.cwd = processCwd(p.pid)
+            q.children = (kids[p.pid] ?? []).map(\.appName)
             let parent = names[p.ppid] ?? ""
             q.owner = (parent == "launchd" || parent.isEmpty) ? "orphan" : parent
             return q
@@ -542,6 +547,7 @@ struct AppMemRow: View {
 struct ProcListView: View {
     let title: String
     let procs: [ProcRecord]
+    @Environment(\.openWindow) private var openWindow
     var body: some View {
         if !procs.isEmpty {
             VStack(alignment: .leading, spacing: 2) {
@@ -558,6 +564,11 @@ struct ProcListView: View {
                 if procs.count > 4 {
                     Text("+ \(procs.count - 4) more").font(.caption2).foregroundColor(.secondary)
                 }
+                Button("See all sessions…") {
+                    openWindow(id: "sessions")
+                    NSApp.activate(ignoringOtherApps: true) // menu-bar-only app: window opens behind otherwise
+                }
+                .buttonStyle(.link).font(.caption2)
             }
         }
     }
@@ -649,6 +660,52 @@ struct MenuContent: View {
     }
 }
 
+struct SessionsView: View {
+    @ObservedObject var monitor: HealthMonitor
+
+    private func section(_ title: String, _ procs: [ProcRecord]) -> some View {
+        Section {
+            ForEach(procs.sorted { ($0.isActive ? 0 : 1, -$0.ageHours) < ($1.isActive ? 0 : 1, -$1.ageHours) }) { p in
+                HStack(alignment: .top, spacing: 8) {
+                    Circle().fill(p.isActive ? Color.green : Color.gray.opacity(0.5))
+                        .frame(width: 8, height: 8).padding(.top, 5)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(p.contextLabel).font(.body)
+                        Text(p.cwd.isEmpty ? "unknown folder" : p.cwd)
+                            .font(.caption).foregroundColor(.secondary)
+                            .lineLimit(1).truncationMode(.head).textSelection(.enabled)
+                        if !p.children.isEmpty {
+                            Text("running: " + p.children.joined(separator: ", "))
+                                .font(.caption).foregroundColor(.green).lineLimit(1)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text("pid \(String(p.pid)) · \(Int(p.ageHours))h")
+                        Text(String(format: "CPU %.1f%% · ", p.cpuPercent) + formatBytes(p.rssBytes))
+                    }
+                    .font(.caption).monospacedDigit().foregroundColor(.secondary)
+                }
+            }
+        } header: {
+            let active = procs.filter(\.isActive).count
+            Text("\(title) — \(procs.count) total, \(active) active").font(.headline)
+        }
+    }
+
+    var body: some View {
+        List {
+            section("Idle shells", monitor.idleShells)
+            section("Stale agent sessions", monitor.staleAgents)
+        }
+        .frame(minWidth: 560, minHeight: 420)
+        .overlay(alignment: .bottom) {
+            Text("Active = has a running child process or ≥1% CPU since the last check.")
+                .font(.caption2).foregroundColor(.secondary).padding(4)
+        }
+    }
+}
+
 // Inline two-step confirm: system dialogs steal focus and close the MenuBarExtra window.
 struct ConfirmButton: View {
     let title: String
@@ -684,6 +741,10 @@ struct MacHealthApp: App {
             }
         }
         .menuBarExtraStyle(.window)
+
+        Window("Sessions", id: "sessions") {
+            SessionsView(monitor: monitor)
+        }
     }
 
     init() {
