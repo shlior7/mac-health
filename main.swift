@@ -453,9 +453,14 @@ final class HealthMonitor: ObservableObject {
         }
     }
 
+    /// Shells with a running child or CPU are doing something; only the truly idle ones are cleanup targets.
+    var killableShells: [ProcRecord] { idleShells.filter { !$0.isActive } }
+
     func killIdleShells() {
-        shellsKilledThisSession += idleShells.count
-        for p in idleShells { kill(p.pid, SIGTERM) }
+        let targets = killableShells
+        shellsKilledThisSession += targets.count
+        // SIGHUP, not SIGTERM: interactive zsh/bash ignore SIGTERM; SIGHUP is what closing a terminal sends.
+        for p in targets { kill(p.pid, SIGHUP) }
         refresh()
     }
 
@@ -645,8 +650,8 @@ struct MenuContent: View {
                 ProcListView(title: "Stale agents", procs: monitor.staleAgents)
 
                 HStack {
-                    ConfirmButton(title: "Kill shells (\(monitor.idleShells.count))", confirmTitle: "Terminate \(monitor.idleShells.count)?") { monitor.killIdleShells() }
-                        .disabled(monitor.idleShells.isEmpty)
+                    ConfirmButton(title: "Kill shells (\(monitor.killableShells.count))", confirmTitle: "Terminate \(monitor.killableShells.count)?") { monitor.killIdleShells() }
+                        .disabled(monitor.killableShells.isEmpty)
                     ConfirmButton(title: "Kill agents (\(monitor.staleAgents.count))", confirmTitle: "Terminate \(monitor.staleAgents.count)?") { monitor.killStaleAgents() }
                         .disabled(monitor.staleAgents.isEmpty)
                 }
