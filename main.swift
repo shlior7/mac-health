@@ -565,9 +565,6 @@ struct ProcListView: View {
 
 struct MenuContent: View {
     @ObservedObject var monitor: HealthMonitor
-    @State private var confirmShells = false
-    @State private var confirmAgents = false
-    @State private var confirmReboot = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -624,16 +621,10 @@ struct MenuContent: View {
                 ProcListView(title: "Stale agents", procs: monitor.staleAgents)
 
                 HStack {
-                    Button("Kill shells (\(monitor.idleShells.count))") { confirmShells = true }
+                    ConfirmButton(title: "Kill shells (\(monitor.idleShells.count))", confirmTitle: "Terminate \(monitor.idleShells.count)?") { monitor.killIdleShells() }
                         .disabled(monitor.idleShells.isEmpty)
-                        .confirmationDialog("Terminate \(monitor.idleShells.count) idle shell processes?", isPresented: $confirmShells) {
-                            Button("Terminate", role: .destructive) { monitor.killIdleShells() }
-                        }
-                    Button("Kill agents (\(monitor.staleAgents.count))") { confirmAgents = true }
+                    ConfirmButton(title: "Kill agents (\(monitor.staleAgents.count))", confirmTitle: "Terminate \(monitor.staleAgents.count)?") { monitor.killStaleAgents() }
                         .disabled(monitor.staleAgents.isEmpty)
-                        .confirmationDialog("Terminate \(monitor.staleAgents.count) stale Claude/agent sessions?", isPresented: $confirmAgents) {
-                            Button("Terminate", role: .destructive) { monitor.killStaleAgents() }
-                        }
                 }
                 .controlSize(.small)
 
@@ -644,10 +635,7 @@ struct MenuContent: View {
             }
 
             HStack {
-                Button("Reboot now") { confirmReboot = true }
-                    .confirmationDialog("Reboot this Mac now?", isPresented: $confirmReboot) {
-                        Button("Reboot", role: .destructive) { monitor.rebootNow() }
-                    }
+                ConfirmButton(title: "Reboot now", confirmTitle: "Reboot?") { monitor.rebootNow() }
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
@@ -658,6 +646,25 @@ struct MenuContent: View {
         }
         .padding(12)
         .frame(width: 320)
+    }
+}
+
+// Inline two-step confirm: system dialogs steal focus and close the MenuBarExtra window.
+struct ConfirmButton: View {
+    let title: String
+    let confirmTitle: String
+    let action: () -> Void
+    @State private var armed = false
+
+    var body: some View {
+        if armed {
+            HStack(spacing: 4) {
+                Button(confirmTitle) { armed = false; action() }.tint(.red)
+                Button("Cancel") { armed = false }
+            }
+        } else {
+            Button(title) { armed = true }
+        }
     }
 }
 
